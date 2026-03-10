@@ -82,3 +82,15 @@ export interface Source {
   /** Total installs across all skills */
   totalInstalls: number;
 }
+
+/**
+ * Refresh history entry used for "since" incremental summaries
+ */
+export interface RefreshHistoryEntry {
+  recordedAt: string;
+  previousScrapedAt: string | null;
+  currentScrapedAt: string;
+  added: number;
+  removed: number;
+  updated: number;
+}

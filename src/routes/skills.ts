@@ -16,6 +16,7 @@ import {
   getTopSources,
   supportedAgents,
 } from '../registry/index.js';
+import { getLastRefreshIncrement, getRefreshHistory } from '../scheduler/index.js';
 import type { PaginatedSkillsResponse, SkillSearchParams } from '../registry/types.js';
 
 const skillsRouter = new Hono();
@@ -219,6 +220,96 @@ skillsRouter.get('/stats', c => {
     totalSources: metadata.totalSources,
     totalOwners: metadata.totalOwners,
     totalInstalls,
+  });
+});
+
+/**
+ * GET /api/skills/incremental
+ * Get incremental changes from the latest successful refresh
+ *
+ * Query Parameters:
+ * - since: ISO timestamp. When provided, returns aggregated summary since this time
+ * - type: Change type (added, removed, updated), default: added
+ * - offset: Pagination offset, default: 0
+ * - limit: Items per page, default: 100, max: 1000
+ */
+skillsRouter.get('/incremental', async c => {
+  const sinceQuery = c.req.query('since');
+  if (sinceQuery) {
+    const sinceMs = Date.parse(sinceQuery);
+    if (!Number.isFinite(sinceMs)) {
+      return c.json(
+        {
+          error: 'Invalid since timestamp. Use ISO 8601 format.',
+          example: '2026-03-10T07:30:00.000Z',
+        },
+        400,
+      );
+    }
+
+    const history = await getRefreshHistory();
+    const entries = history
+      .filter(entry => Date.parse(entry.recordedAt) > sinceMs)
+      .sort((a, b) => Date.parse(a.recordedAt) - Date.parse(b.recordedAt));
+
+    const summary = entries.reduce(
+      (acc, entry) => {
+        acc.added += entry.added;
+        acc.removed += entry.removed;
+        acc.updated += entry.updated;
+        return acc;
+      },
+      { added: 0, removed: 0, updated: 0 },
+    );
+
+    return c.json({
+      mode: 'since',
+      available: history.length > 0,
+      since: new Date(sinceMs).toISOString(),
+      until: getMetadata().scrapedAt,
+      refreshes: entries.length,
+      summary,
+      entries,
+    });
+  }
+
+  const increment = getLastRefreshIncrement();
+  if (!increment) {
+    return c.json({
+      mode: 'latest',
+      available: false,
+      message: 'No incremental data available yet. Trigger /api/admin/refresh first.',
+    });
+  }
+
+  const typeQuery = c.req.query('type') || 'added';
+  const type: 'added' | 'removed' | 'updated' =
+    typeQuery === 'removed' || typeQuery === 'updated' ? typeQuery : 'added';
+  const offset = Math.max(0, parseInt(c.req.query('offset') || '0', 10));
+  const limit = Math.min(1000, Math.max(1, parseInt(c.req.query('limit') || '100', 10)));
+
+  const items = type === 'added' ? increment.added : type === 'removed' ? increment.removed : increment.updated;
+  const paginatedItems = items.slice(offset, offset + limit);
+
+  return c.json({
+    mode: 'latest',
+    available: true,
+    refresh: {
+      previousScrapedAt: increment.previousScrapedAt,
+      currentScrapedAt: increment.currentScrapedAt,
+      recordedAt: increment.recordedAt,
+    },
+    summary: {
+      added: increment.added.length,
+      removed: increment.removed.length,
+      updated: increment.updated.length,
+    },
+    type,
+    total: items.length,
+    offset,
+    limit,
+    hasMore: offset + paginatedItems.length < items.length,
+    items: paginatedItems,
   });
 });
 

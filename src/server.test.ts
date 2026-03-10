@@ -144,6 +144,38 @@ describe('Skills API Server', () => {
     });
   });
 
+  describe('GET /api/skills/incremental', () => {
+    it('returns not available when no refresh delta exists yet', async () => {
+      const res = await app.request('/api/skills/incremental');
+      expect(res.status).toBe(200);
+
+      const body = await res.json();
+      expect(body.mode).toBe('latest');
+      expect(body.available).toBe(false);
+      expect(body.message).toMatch(/incremental data/i);
+    });
+
+    it('supports since mode and returns summary fields', async () => {
+      const res = await app.request('/api/skills/incremental?since=2026-01-01T00:00:00.000Z');
+      expect(res.status).toBe(200);
+
+      const body = await res.json();
+      expect(body.mode).toBe('since');
+      expect(typeof body.summary.added).toBe('number');
+      expect(typeof body.summary.removed).toBe('number');
+      expect(typeof body.summary.updated).toBe('number');
+      expect(Array.isArray(body.entries)).toBe(true);
+    });
+
+    it('returns 400 for invalid since timestamp', async () => {
+      const res = await app.request('/api/skills/incremental?since=not-a-date');
+      expect(res.status).toBe(400);
+
+      const body = await res.json();
+      expect(body.error).toMatch(/invalid since timestamp/i);
+    });
+  });
+
   describe('GET /api/skills/by-source/:owner/:repo', () => {
     it('returns skills from a specific source', async () => {
       const res = await app.request('/api/skills/by-source/vercel-labs/agent-skills');

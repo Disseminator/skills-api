@@ -51,6 +51,8 @@ Storage priority: **S3 > Filesystem > Bundled data**. When both S3 and filesyste
 
 The root page (`/`) serves a browsable directory with search and API documentation. All data endpoints are under `/api`.
 
+For the complete single-file API reference, see [API.md](./API.md).
+
 ### Skills
 
 | Endpoint | Description |
@@ -84,6 +86,7 @@ The root page (`/`) serves a browsable directory with search and API documentati
 | `GET /api/skills/owners` | All owners with counts |
 | `GET /api/skills/agents` | Supported AI agents |
 | `GET /api/skills/stats` | Registry statistics |
+| `GET /api/skills/incremental` | Incremental changes (latest diff or `since`-based summary) |
 
 ### Admin
 
@@ -93,6 +96,16 @@ The root page (`/`) serves a browsable directory with search and API documentati
 | `POST /api/admin/refresh` | Trigger manual refresh |
 | `POST /api/admin/scheduler/start?interval=30` | Start auto-refresh |
 | `POST /api/admin/scheduler/stop` | Stop auto-refresh |
+
+### Incremental API
+
+`GET /api/skills/incremental` supports two modes:
+
+- Latest refresh diff (default):
+  - Query: `type=added|removed|updated`, `offset`, `limit`
+- Since-based summary:
+  - Query: `since=<ISO-8601 timestamp>`
+  - Returns aggregated `added/removed/updated` counts and matching refresh history entries
 
 ## Updating Data
 

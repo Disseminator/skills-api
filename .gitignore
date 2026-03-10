@@ -4,3 +4,4 @@ dist
 *.log
 registry/
 src/registry/scraped-skills.json
+src/registry/refresh-history.json
