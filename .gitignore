@@ -3,3 +3,4 @@ dist
 .turbo
 *.log
 registry/
+src/registry/scraped-skills.json

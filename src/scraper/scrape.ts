@@ -27,25 +27,217 @@ export interface EnrichedSkill extends ScrapedSkill {
   displayName: string;
 }
 
+interface AllTimeSkillsPage {
+  skills: ScrapedSkill[];
+  total: number | null;
+  hasMore: boolean | null;
+  page: number | null;
+}
+
+const SKILLS_BASE_URL = 'https://skills.sh';
+const ALL_TIME_API_BASE = `${SKILLS_BASE_URL}/api/skills/all-time`;
+const MAX_ALL_TIME_PAGES = 1000;
+const API_PAGE_CONCURRENCY = 8;
+
 /**
  * Scrape skills from skills.sh
  */
 export async function scrapeSkills(): Promise<ScrapedSkill[]> {
-  const response = await fetch('https://skills.sh');
-  const html = await response.text();
+  try {
+    return await scrapeSkillsFromAllTimeApi();
+  } catch (apiError) {
+    const message = apiError instanceof Error ? apiError.message : String(apiError);
+    console.warn(`[Scraper] All-time API scrape failed, falling back to page parse: ${message}`);
+    return scrapeSkillsFromPage();
+  }
+}
 
-  // Find the allTimeSkills array in the escaped JSON
-  const match = html.match(/allTimeSkills\\":\[(.*?)\]/);
-  if (!match) {
-    throw new Error('Could not find allTimeSkills in page');
+async function scrapeSkillsFromAllTimeApi(): Promise<ScrapedSkill[]> {
+  const firstPage = await fetchAllTimeSkillsPage(0);
+  if (firstPage.skills.length === 0) {
+    throw new Error('All-time API returned no skills on page 0');
   }
 
-  // Unescape the JSON
-  let jsonStr = '[' + match[1] + ']';
-  jsonStr = jsonStr.replace(/\\"/g, '"');
+  const allSkills = [...firstPage.skills];
+  const totalPages = getTotalPages(firstPage);
 
-  const skills: ScrapedSkill[] = JSON.parse(jsonStr);
-  return skills;
+  if (totalPages !== null) {
+    if (totalPages > MAX_ALL_TIME_PAGES) {
+      throw new Error(`All-time API requires ${totalPages} pages, exceeding max ${MAX_ALL_TIME_PAGES}`);
+    }
+
+    const remainingPages = Array.from({ length: Math.max(0, totalPages - 1) }, (_, index) => index + 1);
+    for (let i = 0; i < remainingPages.length; i += API_PAGE_CONCURRENCY) {
+      const batch = remainingPages.slice(i, i + API_PAGE_CONCURRENCY);
+      const pageResults = await Promise.all(batch.map(page => fetchAllTimeSkillsPage(page)));
+      for (const result of pageResults) {
+        allSkills.push(...result.skills);
+      }
+    }
+
+    return dedupeSkills(allSkills);
+  }
+
+  // Fallback path if total is missing: follow hasMore until exhaustion.
+  let page = 1;
+  let hasMore = firstPage.hasMore ?? true;
+  while (hasMore) {
+    if (page >= MAX_ALL_TIME_PAGES) {
+      throw new Error(`All-time API pagination exceeded ${MAX_ALL_TIME_PAGES} pages`);
+    }
+
+    const nextPage = await fetchAllTimeSkillsPage(page);
+    if (nextPage.skills.length === 0) {
+      break;
+    }
+
+    allSkills.push(...nextPage.skills);
+    hasMore = nextPage.hasMore ?? false;
+    page += 1;
+  }
+
+  return dedupeSkills(allSkills);
+}
+
+async function scrapeSkillsFromPage(): Promise<ScrapedSkill[]> {
+  const response = await fetch(SKILLS_BASE_URL);
+  if (!response.ok) {
+    throw new Error(`Failed to load skills.sh page (${response.status})`);
+  }
+
+  const html = await response.text();
+  return extractSkillsFromPageHtml(html);
+}
+
+async function fetchAllTimeSkillsPage(page: number): Promise<AllTimeSkillsPage> {
+  const response = await fetch(`${ALL_TIME_API_BASE}/${page}`);
+  if (!response.ok) {
+    throw new Error(`All-time API request failed for page ${page} (${response.status})`);
+  }
+
+  const payload = (await response.json()) as Record<string, unknown>;
+  const skills = toScrapedSkills(payload.skills);
+  const total = typeof payload.total === 'number' ? payload.total : null;
+  const hasMore = typeof payload.hasMore === 'boolean' ? payload.hasMore : null;
+  const pageFromPayload = typeof payload.page === 'number' ? payload.page : null;
+
+  return {
+    skills,
+    total,
+    hasMore,
+    page: pageFromPayload,
+  };
+}
+
+function getTotalPages(page: AllTimeSkillsPage): number | null {
+  if (page.total === null || page.total <= 0) {
+    return null;
+  }
+
+  const pageSize = page.skills.length;
+  if (pageSize <= 0) {
+    return null;
+  }
+
+  return Math.ceil(page.total / pageSize);
+}
+
+function extractSkillsFromPageHtml(html: string): ScrapedSkill[] {
+  for (const key of ['allTimeSkills', 'initialSkills']) {
+    const parsed = tryExtractEscapedArrayByKey(html, key);
+    if (parsed !== null) {
+      return parsed;
+    }
+  }
+
+  throw new Error('Could not find allTimeSkills or initialSkills in page');
+}
+
+function tryExtractEscapedArrayByKey(html: string, key: string): ScrapedSkill[] | null {
+  const escapedKey = escapeRegExp(key);
+  const candidates = [
+    {
+      regex: new RegExp(`${escapedKey}\\\\":\\[([\\s\\S]*?)\\]`),
+      unescape: true,
+    },
+    {
+      regex: new RegExp(`"${escapedKey}":\\[([\\s\\S]*?)\\]`),
+      unescape: false,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    const match = html.match(candidate.regex);
+    if (!match) {
+      continue;
+    }
+
+    let jsonStr = `[${match[1]}]`;
+    if (candidate.unescape) {
+      jsonStr = jsonStr.replace(/\\"/g, '"');
+    }
+
+    try {
+      const parsed = JSON.parse(jsonStr);
+      return toScrapedSkills(parsed);
+    } catch {
+      continue;
+    }
+  }
+
+  return null;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function toScrapedSkills(value: unknown): ScrapedSkill[] {
+  if (!Array.isArray(value)) {
+    throw new Error('Expected skills to be an array');
+  }
+
+  return value.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`Invalid skill at index ${index}: expected object`);
+    }
+
+    const source = (entry as { source?: unknown }).source;
+    const skillId = (entry as { skillId?: unknown }).skillId;
+    const name = (entry as { name?: unknown }).name;
+    const installsRaw = (entry as { installs?: unknown }).installs;
+    const installs =
+      typeof installsRaw === 'number'
+        ? installsRaw
+        : typeof installsRaw === 'string'
+          ? Number.parseInt(installsRaw, 10)
+          : Number.NaN;
+
+    if (
+      typeof source !== 'string' ||
+      typeof skillId !== 'string' ||
+      typeof name !== 'string' ||
+      !Number.isFinite(installs)
+    ) {
+      throw new Error(`Invalid skill at index ${index}: malformed fields`);
+    }
+
+    return {
+      source,
+      skillId,
+      name,
+      installs,
+    };
+  });
+}
+
+function dedupeSkills(skills: ScrapedSkill[]): ScrapedSkill[] {
+  const deduped = new Map<string, ScrapedSkill>();
+  for (const skill of skills) {
+    deduped.set(`${skill.source}::${skill.skillId}`, skill);
+  }
+
+  return Array.from(deduped.values());
 }
 
 /**
