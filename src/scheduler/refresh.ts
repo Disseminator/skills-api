@@ -236,6 +236,9 @@ export async function refreshSkillsData(): Promise<RefreshResult> {
       added: increment.added.length,
       removed: increment.removed.length,
       updated: increment.updated.length,
+      addedItems: increment.added,
+      removedItems: increment.removed,
+      updatedItems: increment.updated,
     };
     try {
       await appendRefreshHistory(historyEntry);

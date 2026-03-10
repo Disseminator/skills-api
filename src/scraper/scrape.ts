@@ -36,57 +36,116 @@ interface AllTimeSkillsPage {
 
 const SKILLS_BASE_URL = 'https://skills.sh';
 const ALL_TIME_API_BASE = `${SKILLS_BASE_URL}/api/skills/all-time`;
-const MAX_ALL_TIME_PAGES = 1000;
-const API_PAGE_CONCURRENCY = 8;
+
+interface ScraperConfig {
+  maxAllTimePages: number;
+  pageConcurrency: number;
+  batchDelayMs: number;
+  requestTimeoutMs: number;
+  maxRetries: number;
+  retryBaseMs: number;
+  minCoverageRatio: number;
+  allowHtmlFallback: boolean;
+}
+
+function parseIntEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function parseFloatEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function parseBoolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(raw.toLowerCase());
+}
+
+function getScraperConfig(): ScraperConfig {
+  return {
+    maxAllTimePages: parseIntEnv('SCRAPER_MAX_ALL_TIME_PAGES', 1000, 10, 5000),
+    pageConcurrency: parseIntEnv('SCRAPER_API_PAGE_CONCURRENCY', 4, 1, 20),
+    batchDelayMs: parseIntEnv('SCRAPER_API_BATCH_DELAY_MS', 300, 0, 10000),
+    requestTimeoutMs: parseIntEnv('SCRAPER_API_TIMEOUT_MS', 15000, 1000, 120000),
+    maxRetries: parseIntEnv('SCRAPER_API_MAX_RETRIES', 4, 1, 10),
+    retryBaseMs: parseIntEnv('SCRAPER_API_RETRY_BASE_MS', 1000, 100, 30000),
+    minCoverageRatio: parseFloatEnv('SCRAPER_API_MIN_COVERAGE_RATIO', 0.95, 0.5, 1),
+    allowHtmlFallback: parseBoolEnv('SCRAPER_ALLOW_HTML_FALLBACK', false),
+  };
+}
 
 /**
  * Scrape skills from skills.sh
  */
 export async function scrapeSkills(): Promise<ScrapedSkill[]> {
+  const config = getScraperConfig();
+
   try {
-    return await scrapeSkillsFromAllTimeApi();
+    return await scrapeSkillsFromAllTimeApi(config);
   } catch (apiError) {
     const message = apiError instanceof Error ? apiError.message : String(apiError);
-    console.warn(`[Scraper] All-time API scrape failed, falling back to page parse: ${message}`);
-    return scrapeSkillsFromPage();
+    if (!config.allowHtmlFallback) {
+      throw new Error(
+        `All-time API scrape failed: ${message}. ` +
+          `HTML fallback is disabled (set SCRAPER_ALLOW_HTML_FALLBACK=true to enable emergency fallback).`,
+      );
+    }
+
+    console.warn(`[Scraper] All-time API scrape failed, using emergency HTML fallback: ${message}`);
+    return scrapeSkillsFromPage(config);
   }
 }
 
-async function scrapeSkillsFromAllTimeApi(): Promise<ScrapedSkill[]> {
-  const firstPage = await fetchAllTimeSkillsPage(0);
+async function scrapeSkillsFromAllTimeApi(config: ScraperConfig): Promise<ScrapedSkill[]> {
+  const firstPage = await fetchAllTimeSkillsPage(0, config);
   if (firstPage.skills.length === 0) {
     throw new Error('All-time API returned no skills on page 0');
   }
 
   const allSkills = [...firstPage.skills];
-  const totalPages = getTotalPages(firstPage);
+  const totalPages = getTotalPages(firstPage, config);
 
   if (totalPages !== null) {
-    if (totalPages > MAX_ALL_TIME_PAGES) {
-      throw new Error(`All-time API requires ${totalPages} pages, exceeding max ${MAX_ALL_TIME_PAGES}`);
+    if (totalPages > config.maxAllTimePages) {
+      throw new Error(`All-time API requires ${totalPages} pages, exceeding max ${config.maxAllTimePages}`);
     }
 
     const remainingPages = Array.from({ length: Math.max(0, totalPages - 1) }, (_, index) => index + 1);
-    for (let i = 0; i < remainingPages.length; i += API_PAGE_CONCURRENCY) {
-      const batch = remainingPages.slice(i, i + API_PAGE_CONCURRENCY);
-      const pageResults = await Promise.all(batch.map(page => fetchAllTimeSkillsPage(page)));
+    for (let i = 0; i < remainingPages.length; i += config.pageConcurrency) {
+      const batch = remainingPages.slice(i, i + config.pageConcurrency);
+      const pageResults = await Promise.all(batch.map(page => fetchAllTimeSkillsPage(page, config)));
       for (const result of pageResults) {
         allSkills.push(...result.skills);
       }
+
+      if (i + config.pageConcurrency < remainingPages.length && config.batchDelayMs > 0) {
+        await sleep(config.batchDelayMs);
+      }
     }
 
-    return dedupeSkills(allSkills);
+    const deduped = dedupeSkills(allSkills);
+    assertCoverage(deduped, firstPage.total, config.minCoverageRatio);
+    return deduped;
   }
 
   // Fallback path if total is missing: follow hasMore until exhaustion.
   let page = 1;
   let hasMore = firstPage.hasMore ?? true;
   while (hasMore) {
-    if (page >= MAX_ALL_TIME_PAGES) {
-      throw new Error(`All-time API pagination exceeded ${MAX_ALL_TIME_PAGES} pages`);
+    if (page >= config.maxAllTimePages) {
+      throw new Error(`All-time API pagination exceeded ${config.maxAllTimePages} pages`);
     }
 
-    const nextPage = await fetchAllTimeSkillsPage(page);
+    const nextPage = await fetchAllTimeSkillsPage(page, config);
     if (nextPage.skills.length === 0) {
       break;
     }
@@ -94,42 +153,122 @@ async function scrapeSkillsFromAllTimeApi(): Promise<ScrapedSkill[]> {
     allSkills.push(...nextPage.skills);
     hasMore = nextPage.hasMore ?? false;
     page += 1;
+
+    if (hasMore && config.batchDelayMs > 0) {
+      await sleep(config.batchDelayMs);
+    }
   }
 
-  return dedupeSkills(allSkills);
+  const deduped = dedupeSkills(allSkills);
+  assertCoverage(deduped, firstPage.total, config.minCoverageRatio);
+  return deduped;
 }
 
-async function scrapeSkillsFromPage(): Promise<ScrapedSkill[]> {
+function getRetryDelayMs(attempt: number, baseMs: number): number {
+  const jitter = Math.floor(Math.random() * 250);
+  return baseMs * 2 ** Math.max(0, attempt - 1) + jitter;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function assertCoverage(skills: ScrapedSkill[], total: number | null, minCoverageRatio: number): void {
+  if (total === null || total <= 0) return;
+  const coverage = skills.length / total;
+  if (coverage < minCoverageRatio) {
+    throw new Error(
+      `All-time API returned incomplete dataset (${skills.length}/${total}, ${(coverage * 100).toFixed(1)}% coverage)`,
+    );
+  }
+}
+
+async function scrapeSkillsFromPage(config: ScraperConfig): Promise<ScrapedSkill[]> {
   const response = await fetch(SKILLS_BASE_URL);
   if (!response.ok) {
     throw new Error(`Failed to load skills.sh page (${response.status})`);
   }
 
   const html = await response.text();
-  return extractSkillsFromPageHtml(html);
+  const extracted = extractSkillsFromPageHtml(html);
+  console.warn(
+    `[Scraper] Emergency HTML fallback returned ${extracted.length} skills. ` +
+      `For full data, fix all-time API connectivity and disable fallback in production.`,
+  );
+  if (config.minCoverageRatio >= 1 && extracted.length === 0) {
+    throw new Error('Emergency HTML fallback returned no skills');
+  }
+  return extracted;
 }
 
-async function fetchAllTimeSkillsPage(page: number): Promise<AllTimeSkillsPage> {
-  const response = await fetch(`${ALL_TIME_API_BASE}/${page}`);
-  if (!response.ok) {
-    throw new Error(`All-time API request failed for page ${page} (${response.status})`);
+async function fetchAllTimeSkillsPage(page: number, config: ScraperConfig): Promise<AllTimeSkillsPage> {
+  const url = `${ALL_TIME_API_BASE}/${page}`;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= config.maxRetries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+        },
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const retryable = response.status === 429 || response.status >= 500;
+        const message = `All-time API request failed for page ${page} (${response.status})`;
+        if (!retryable) {
+          throw new Error(`${message}, non-retryable`);
+        }
+        throw new Error(message);
+      }
+
+      const payload = (await response.json()) as Record<string, unknown>;
+      const skills = toScrapedSkills(payload.skills);
+      const total = typeof payload.total === 'number' ? payload.total : null;
+      const hasMore = typeof payload.hasMore === 'boolean' ? payload.hasMore : null;
+      const pageFromPayload = typeof payload.page === 'number' ? payload.page : null;
+
+      return {
+        skills,
+        total,
+        hasMore,
+        page: pageFromPayload,
+      };
+    } catch (error) {
+      clearTimeout(timeout);
+      const err = toError(error);
+      lastError = err;
+
+      if (err.message.includes('non-retryable')) {
+        throw err;
+      }
+
+      if (attempt < config.maxRetries) {
+        const delay = getRetryDelayMs(attempt, config.retryBaseMs);
+        console.warn(
+          `[Scraper] API page ${page} attempt ${attempt}/${config.maxRetries} failed: ${err.message}. Retrying in ${delay}ms`,
+        );
+        await sleep(delay);
+        continue;
+      }
+    }
   }
 
-  const payload = (await response.json()) as Record<string, unknown>;
-  const skills = toScrapedSkills(payload.skills);
-  const total = typeof payload.total === 'number' ? payload.total : null;
-  const hasMore = typeof payload.hasMore === 'boolean' ? payload.hasMore : null;
-  const pageFromPayload = typeof payload.page === 'number' ? payload.page : null;
-
-  return {
-    skills,
-    total,
-    hasMore,
-    page: pageFromPayload,
-  };
+  throw new Error(
+    `All-time API request failed for page ${page} after ${config.maxRetries} attempts: ${lastError?.message ?? 'unknown error'}`,
+  );
 }
 
-function getTotalPages(page: AllTimeSkillsPage): number | null {
+function getTotalPages(page: AllTimeSkillsPage, config: ScraperConfig): number | null {
   if (page.total === null || page.total <= 0) {
     return null;
   }
@@ -139,7 +278,11 @@ function getTotalPages(page: AllTimeSkillsPage): number | null {
     return null;
   }
 
-  return Math.ceil(page.total / pageSize);
+  const totalPages = Math.ceil(page.total / pageSize);
+  if (totalPages > config.maxAllTimePages) {
+    throw new Error(`All-time API requires ${totalPages} pages, exceeding max ${config.maxAllTimePages}`);
+  }
+  return totalPages;
 }
 
 function extractSkillsFromPageHtml(html: string): ScrapedSkill[] {

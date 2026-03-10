@@ -97,6 +97,7 @@ describe('Skills API Server', () => {
       expect(body.sources).toBeInstanceOf(Array);
       expect(body.sources.length).toBeGreaterThan(0);
       expect(body.sources[0]).toHaveProperty('source');
+      expect(body.sources[0]).toHaveProperty('githubUrl');
       expect(body.sources[0]).toHaveProperty('skillCount');
       expect(body.sources[0]).toHaveProperty('totalInstalls');
     });
@@ -155,8 +156,8 @@ describe('Skills API Server', () => {
       expect(body.message).toMatch(/incremental data/i);
     });
 
-    it('supports since mode and returns summary fields', async () => {
-      const res = await app.request('/api/skills/incremental?since=2026-01-01T00:00:00.000Z');
+    it('supports since mode and returns summary fields plus data payload', async () => {
+      const res = await app.request('/api/skills/incremental?since=2026-01-01T00:00:00.000Z&type=added&limit=10');
       expect(res.status).toBe(200);
 
       const body = await res.json();
@@ -164,7 +165,33 @@ describe('Skills API Server', () => {
       expect(typeof body.summary.added).toBe('number');
       expect(typeof body.summary.removed).toBe('number');
       expect(typeof body.summary.updated).toBe('number');
+      expect(body.type).toBe('added');
+      expect(typeof body.total).toBe('number');
+      expect(typeof body.offset).toBe('number');
+      expect(typeof body.limit).toBe('number');
+      expect(typeof body.hasMore).toBe('boolean');
+      expect(typeof body.details.complete).toBe('boolean');
+      expect(typeof body.details.missingEntries).toBe('number');
+      expect(Array.isArray(body.items)).toBe(true);
       expect(Array.isArray(body.entries)).toBe(true);
+    });
+
+    it('supports groupBy=source for since mode', async () => {
+      const res = await app.request(
+        '/api/skills/incremental?since=2026-01-01T00:00:00.000Z&type=added&groupBy=source&limit=10',
+      );
+      expect(res.status).toBe(200);
+
+      const body = await res.json();
+      expect(body.mode).toBe('since');
+      expect(body.groupBy).toBe('source');
+      expect(typeof body.total).toBe('number');
+      expect(typeof body.itemTotal).toBe('number');
+      expect(typeof body.hasMore).toBe('boolean');
+      expect(Array.isArray(body.sources)).toBe(true);
+      if (body.sources.length > 0) {
+        expect(body.sources[0]).toHaveProperty('githubUrl');
+      }
     });
 
     it('returns 400 for invalid since timestamp', async () => {
